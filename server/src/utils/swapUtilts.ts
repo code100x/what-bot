@@ -1,17 +1,34 @@
 import {
   ApiPoolInfoV4,
+  InnerSimpleV0Transaction,
   LIQUIDITY_STATE_LAYOUT_V4,
   Liquidity,
   LiquidityPoolKeys,
   MARKET_STATE_LAYOUT_V3,
   Market,
+  Percent,
+  SPL_ACCOUNT_LAYOUT,
   SPL_MINT_LAYOUT,
+  TOKEN_PROGRAM_ID,
+  Token,
+  TokenAccount,
+  TokenAmount,
+  TxVersion,
+  buildSimpleTransaction,
   jsonInfo2PoolKeys,
 } from "@raydium-io/raydium-sdk";
 import { sleep } from "../utils/utils";
 import { connection } from "../config";
-import { Connection, PublicKey } from "@solana/web3.js";
-import { quoteInputInfo } from "../types/types";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  SendOptions,
+  Transaction,
+  VersionedTransaction,
+} from "@solana/web3.js";
+import { WalletTokenAccounts, quoteInputInfo } from "../types/types";
+import bs58 from "bs58";
 export async function swapQuote(input: quoteInputInfo) {
   try {
     const targetPoolInfo = await formatAmmKeysById(input.targetPool);
@@ -51,6 +68,68 @@ export async function swapQuote(input: quoteInputInfo) {
   } catch (error) {
     console.error("couldn't get a quote :", error);
     return { error: error };
+  }
+}
+export async function swapOnlyAmm(
+  outputToken: Token,
+  targetPool: string,
+  inputTokenAmount: TokenAmount,
+  slippagePercentage: Percent,
+  walletTokenAccounts: WalletTokenAccounts,
+  wallet: Keypair,
+  priorityFee: number = 1000000,
+  connection: Connection
+) {
+  try {
+    const targetPoolInfo = await formatAmmKeysById(targetPool);
+    if (!targetPoolInfo) throw new Error("cannot find the target pool");
+    const poolKeys = jsonInfo2PoolKeys(targetPoolInfo) as LiquidityPoolKeys;
+    const poolInfo = await fetchInfoWithRetrys(poolKeys);
+
+    if (!poolInfo) {
+      throw new Error("Couldn't fetch pool info, quote fetch failed");
+    }
+    const amountOut = new TokenAmount(outputToken, 1);
+
+    const { innerTransactions } = await Liquidity.makeSwapInstructionSimple({
+      connection: connection,
+      poolKeys,
+      userKeys: {
+        tokenAccounts: walletTokenAccounts,
+        owner: wallet.publicKey,
+      },
+      amountIn: inputTokenAmount,
+      amountOut: amountOut,
+      fixedSide: "in",
+      makeTxVersion: TxVersion.V0,
+      computeBudgetConfig: {
+        microLamports: Math.floor(priorityFee * 12.5),
+        units: 70000,
+      },
+      lookupTableCache: {},
+    });
+
+    console.log("Swap attempted for the following parameters", {
+      UserWallet: wallet.publicKey.toBase58(),
+      InputAmount: inputTokenAmount.raw.toString(),
+      OutputToken: outputToken.mint.toBase58(),
+      AmountOut: amountOut.toFixed(),
+      PriorityFee: (priorityFee * 0.875) / 10 ** 9 + " SOL",
+      Slippage: parseInt(slippagePercentage.toFixed(0)) * 100,
+      rpcUrl: connection.rpcEndpoint.toString(),
+      Date: Date.now(),
+    });
+    const signature = await buildAndSendTx(wallet, innerTransactions, {
+      skipPreflight: true,
+      preflightCommitment: "confirmed",
+    });
+
+    console.log("swap tx succeeded:", signature);
+    return { txid: signature, error: null };
+  } catch (error: any) {
+    console.log(error);
+    console.log("swap tx failed:", error.reason);
+    return { txid: null, error: error };
   }
 }
 export async function fetchInfoWithRetrys(
@@ -135,4 +214,106 @@ export async function formatAmmKeysById(id: string): Promise<ApiPoolInfoV4> {
     marketEventQueue: marketInfo.eventQueue.toString(),
     lookupTableAccount: PublicKey.default.toString(),
   };
+}
+export async function buildAndSendTx(
+  wallet: Keypair,
+  innerSimpleV0Transaction: InnerSimpleV0Transaction[],
+  options?: SendOptions
+) {
+  const willSendTx = await buildSimpleTransaction({
+    makeTxVersion: TxVersion.V0,
+    connection,
+    payer: wallet.publicKey,
+    innerTransactions: innerSimpleV0Transaction,
+  });
+
+  return await customSendAndConfirmTx(wallet, willSendTx[0], options);
+}
+export async function customSendAndConfirmTx(
+  payer: Keypair,
+  tx: VersionedTransaction | Transaction,
+  options?: SendOptions
+): Promise<string> {
+  const startTime = Date.now();
+
+  if (!(tx instanceof VersionedTransaction)) {
+    throw new Error("Transaction type not supported");
+  }
+  tx.sign([payer]);
+  let tx_signature: any = bs58.encode(tx.signatures[0]);
+  connection.sendTransaction(tx, options);
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      connection
+        .removeSignatureListener(subscriptionId)
+        .then(() => {
+          console.log(
+            `Timeout: stopped listening for signature ${tx_signature}`
+          );
+        })
+        .catch((error) => {
+          console.error(
+            `Failed to remove listener for signature ${tx_signature}:`,
+            error
+          );
+        });
+      reject(
+        new Error(
+          "Timeout: Swap did not complete within 60 seconds, assuming failed"
+        )
+      );
+    }, 60000);
+    const subscriptionId = connection.onSignature(
+      tx_signature,
+      (update, context) => {
+        clearTimeout(timeoutId);
+        connection
+          .removeSignatureListener(subscriptionId)
+          .then(() => {
+            const endTime = Date.now();
+            const duration = (endTime - startTime) / 1000;
+            console.log("total time it took to confirm tx is :", duration);
+            console.log(
+              `Received confirmation for ${tx_signature} closed connection with status: `,
+              update
+            );
+          })
+          .catch((error) => {
+            console.error(
+              `Failed to unsubscribe from signature ${tx_signature}:`,
+              error
+            );
+          });
+        resolve(tx_signature);
+      },
+      "confirmed"
+    );
+  });
+}
+export async function getWalletTokenAccounts(
+  connection: Connection,
+  wallet: PublicKey,
+  inputMint: PublicKey,
+  outputMint: PublicKey
+): Promise<TokenAccount[]> {
+  const [inputMintAccounts, outputMintAccounts] = await Promise.all([
+    connection.getTokenAccountsByOwner(wallet, {
+      programId: TOKEN_PROGRAM_ID,
+      mint: inputMint,
+    }),
+    connection.getTokenAccountsByOwner(wallet, {
+      programId: TOKEN_PROGRAM_ID,
+      mint: outputMint,
+    }),
+  ]);
+
+  const combinedAccounts = [
+    ...inputMintAccounts.value,
+    ...outputMintAccounts.value,
+  ];
+  return combinedAccounts.map((i) => ({
+    pubkey: i.pubkey,
+    programId: i.account.owner,
+    accountInfo: SPL_ACCOUNT_LAYOUT.decode(i.account.data),
+  }));
 }

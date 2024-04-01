@@ -160,5 +160,84 @@ router.get("/dummy-quote", async (req, res) => {
     res.status(500).send("Error in getting quote");
   }
 });
+router.get("/dummy-swap", async (req, res) => {
+  try {
+    // Hardcoded parameters
+    const inputMint = "So11111111111111111111111111111111111111112";
+    const outputMint = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+    const amount = 100000; // in lamports
+    const slippage = new Percent(10000, 100);
 
+    // const poolData = await queryPoolData(inputMint, outputMint);
+    const poolData = {
+      JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN: {
+        mint: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        decimals: 6,
+      },
+      So11111111111111111111111111111111111111112: {
+        mint: "So11111111111111111111111111111111111111112",
+        decimals: 9,
+      },
+      poolId: "EYErUp5muPYEEkeaUCY22JibeZX7E9UuMcJFZkmNAN7c",
+    };
+
+    if (!poolData) {
+      return res.status(404).json({ message: "Pool data not found." });
+    }
+
+    const inputTokenInfo = { mint: inputMint, decimals: 9 };
+    const outputTokenInfo = { mint: outputMint, decimals: 6 };
+
+    const inputToken = new Token(
+      TOKEN_PROGRAM_ID,
+      new PublicKey(inputTokenInfo.mint),
+      inputTokenInfo.decimals
+    );
+
+    const outputToken = new Token(
+      TOKEN_PROGRAM_ID,
+      new PublicKey(outputTokenInfo.mint),
+      outputTokenInfo.decimals
+    );
+
+    const inputTokenAmount = new TokenAmount(inputToken, amount);
+
+    try {
+      const quoteResult = await swapQuote({
+        outputToken,
+        targetPool: poolData.poolId,
+        inputTokenAmount,
+        slippage,
+      });
+
+      if (!quoteResult?.quote?.amountOut || !quoteResult?.quote?.minAmountOut) {
+        throw new Error("Invalid quote structure received.");
+      }
+
+      return res.status(200).json({
+        message: "Quote fetched successfully",
+        swapQuote: {
+          inputMint: inputTokenInfo.mint,
+          inputMintDecimals: inputTokenInfo.decimals,
+          outputMint: outputTokenInfo.mint,
+          outputMintDecimals: outputTokenInfo.decimals,
+          amountIn: amount,
+          amountOut: quoteResult.quote.amountOut,
+          minAmountOut: quoteResult.quote.minAmountOut,
+          quote: quoteResult.quote,
+          ammKey: poolData.poolId,
+          slippage: slippage.toString(),
+        },
+      });
+    } catch (error: any) {
+      console.error("Swap quote error:", error.message);
+      return res
+        .status(500)
+        .json({ message: error.message || "Error fetching swap quote" });
+    }
+  } catch (error: any) {
+    console.error("Error in getting quote:", error.message);
+    res.status(500).send("Error in getting quote");
+  }
+});
 export default router;
