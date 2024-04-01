@@ -1,5 +1,6 @@
 import {
   ApiPoolInfoV4,
+  BigNumberish,
   InnerSimpleV0Transaction,
   LIQUIDITY_STATE_LAYOUT_V4,
   Liquidity,
@@ -27,8 +28,56 @@ import {
   Transaction,
   VersionedTransaction,
 } from "@solana/web3.js";
-import { WalletTokenAccounts, quoteInputInfo } from "../types/types";
+import { TokenInfo, WalletTokenAccounts, quoteInputInfo } from "../types/types";
 import bs58 from "bs58";
+export async function swap(
+  inputTokenInfo: TokenInfo,
+  outputTokenInfo: TokenInfo,
+  targetPool: string,
+  wallet: Keypair,
+  inputAmount: BigNumberish,
+  priorityFee: number = 1000000,
+  slippageBPS: number = 1000 // Default slippage is 1%
+) {
+  const inputToken = new Token(
+    TOKEN_PROGRAM_ID,
+    new PublicKey(inputTokenInfo.mint),
+    inputTokenInfo.decimals
+  );
+
+  const outputToken = new Token(
+    TOKEN_PROGRAM_ID,
+    new PublicKey(outputTokenInfo.mint),
+    outputTokenInfo.decimals
+  );
+
+  const inputTokenAmount = new TokenAmount(inputToken, inputAmount);
+  const slippagePercentage = new Percent(slippageBPS / 100, 100);
+
+  const walletTokenAccounts = await getWalletTokenAccounts(
+    connection,
+    wallet.publicKey,
+    new PublicKey(inputTokenInfo.mint),
+    new PublicKey(outputTokenInfo.mint)
+  );
+
+  try {
+    const res = await swapOnlyAmm(
+      outputToken,
+      targetPool,
+      inputTokenAmount,
+      slippagePercentage,
+      walletTokenAccounts,
+      wallet,
+      priorityFee,
+      connection
+    );
+
+    return { txid: res?.txid, error: res.error };
+  } catch (error: any) {
+    console.error("Swap failed:", error);
+  }
+}
 export async function swapQuote(input: quoteInputInfo) {
   try {
     const targetPoolInfo = await formatAmmKeysById(input.targetPool);

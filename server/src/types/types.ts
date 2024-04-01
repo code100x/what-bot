@@ -10,3 +10,7 @@ export type quoteInputInfo = {
 export type WalletTokenAccounts = Awaited<
   ReturnType<typeof getWalletTokenAccounts>
 >;
+export interface TokenInfo {
+  mint: string;
+  decimals: number;
+}
